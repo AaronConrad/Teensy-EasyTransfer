@@ -1,3 +1,15 @@
+This Fork of Arudino-EasyTransfer provides these extra features:
+* Uses a CRC8 instead of a checksum to verify data integrity.
+* Refactors the receiving logic to be easier to debug.
+* Uncomment the PRINT_DEBUG flag in EasyTransfer.cpp to get some info printed to Serial.
+
+Limitations:
+* This library has a dependency on the FastCRC library: https://github.com/FrankBoesing/FastCRC
+* Because of FastCRC, this is designed only for Teensy boards: https://www.pjrc.com/teensy/
+* Only the general, Serial, version of EasyTransfer has been updated.
+
+Original README below:
+
 /******************************************************************
 *  EasyTransfer Arduino Library v2.1
 *		details and example sketch: 
