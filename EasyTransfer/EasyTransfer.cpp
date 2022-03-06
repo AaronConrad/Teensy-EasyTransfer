@@ -1,87 +1,157 @@
 #include "EasyTransfer.h"
 
+const static uint8_t HEADER_BYTE_1 = 0x06;
+const static uint8_t HEADER_BYTE_2 = 0x85;
+const static EASY_TRANSFER_PRINT_DEBUG = false;
 
-
-
-//Captures address and size of struct
 void EasyTransfer::begin(uint8_t * ptr, uint8_t length, Stream *theStream){
 	address = ptr;
 	size = length;
 	_stream = theStream;
 	
 	//dynamic creation of rx parsing buffer in RAM
-	rx_buffer = (uint8_t*) malloc(size+1);
+	rx_buffer = (uint8_t*) malloc(size + 1);
+    for (uint8_t i = 0; i < size + 1; i++)
+    {
+        rx_buffer[i] = 0x00;
+    }
+
+    current_stage = ReceiveState::RX_STATE_HEADER_1;
 }
 
-//Sends out struct in binary, with header, length info and checksum
-void EasyTransfer::sendData(){
-  uint8_t CS = size;
-  _stream->write(0x06);
-  _stream->write(0x85);
-  _stream->write(size);
-  for(int i = 0; i<size; i++){
-    CS^=*(address+i);
-    _stream->write(*(address+i));
-  }
-  _stream->write(CS);
+void EasyTransfer::sendData()
+{
+    _stream->write(HEADER_BYTE_1);
+    _stream->write(HEADER_BYTE_2);
+    _stream->write(size);
+    for (uint8_t i = 0; i < size; i++)
+    {
+        _stream->write(*(address+i));
+    }
+    uint8_t crc = CRC8.smbus(address, size);
+    _stream->write(crc);
 
-}
-
-boolean EasyTransfer::receiveData(){
-  
-  //start off by looking for the header bytes. If they were already found in a previous call, skip it.
-  if(rx_len == 0){
-  //this size check may be redundant due to the size check below, but for now I'll leave it the way it is.
-    if(_stream->available() >= 3){
-	//this will block until a 0x06 is found or buffer size becomes less then 3.
-      while(_stream->read() != 0x06) {
-		//This will trash any preamble junk in the serial buffer
-		//but we need to make sure there is enough in the buffer to process while we trash the rest
-		//if the buffer becomes too empty, we will escape and try again on the next call
-		if(_stream->available() < 3)
-			return false;
-		}
-      if (_stream->read() == 0x85){
-        rx_len = _stream->read();
-		//make sure the binary structs on both Arduinos are the same size.
-        if(rx_len != size){
-          rx_len = 0;
-          return false;
+    if (EASY_TRANSFER_PRINT_DEBUG)
+    {
+        Serial.print("Transmitting: ");
+        for (int i = 0; i < size; i++)
+        {
+            Serial.printf("%02x ", *(address+i));
         }
-      }
+        Serial.println(); 
     }
-  }
-  
-  //we get here if we already found the header bytes, the struct size matched what we know, and now we are byte aligned.
-  if(rx_len != 0){
-    while(_stream->available() && rx_array_inx <= rx_len){
-      rx_buffer[rx_array_inx++] = _stream->read();
+}
+
+boolean EasyTransfer::receiveData()
+{
+    // This is a rudamentary state machine.  If at any point the stream
+    // is entirely emptied, the function exits and can pick up where it left
+    // off the next time it's called.
+
+    // First check for header byte #1
+    if (current_stage == ReceiveState::RX_STATE_HEADER_1)
+    {
+        // This blocks until the header is found or the stream has been emptied
+        while (_stream->available())
+        {
+            if (_stream->read() == HEADER_BYTE_1)
+            {
+                current_stage = ReceiveState::RX_STATE_HEADER_2;
+                break;
+            }
+        }
     }
-    
-    if(rx_len == (rx_array_inx-1)){
-      //seem to have got whole message
-      //last uint8_t is CS
-      calc_CS = rx_len;
-      for (int i = 0; i<rx_len; i++){
-        calc_CS^=rx_buffer[i];
-      } 
-      
-      if(calc_CS == rx_buffer[rx_array_inx-1]){//CS good
-        memcpy(address,rx_buffer,size);
-		rx_len = 0;
-		rx_array_inx = 0;
-		return true;
-		}
-		
-	  else{
-	  //failed checksum, need to clear this out anyway
-		rx_len = 0;
-		rx_array_inx = 0;
-		return false;
-	  }
-        
+
+    // Next check for header byte #2
+    if (current_stage == ReceiveState::RX_STATE_HEADER_2)
+    {
+        if (_stream->available())
+        {
+            if (_stream->read() == HEADER_BYTE_2)
+            {
+                current_stage = ReceiveState::RX_STATE_SIZE;
+            }
+            else
+            {
+                // Header is corrupted
+                current_stage = ReceiveState::RX_STATE_HEADER_1;
+                return false;  // Return immediately for performance reasons
+            }
+        }
+        else
+        {
+            return false;  // Return immediately for performance reasons
+        }
     }
-  }
-  
-  return false;
+
+    // Next check for header byte #3
+    if (current_stage == ReceiveState::RX_STATE_SIZE)
+    {
+        if (_stream->available())
+        {
+            if (_stream->read() == size)
+            {
+                current_stage = ReceiveState::RX_STATE_PACKET;
+            }
+            else
+            {
+                // Header is corrupted
+                current_stage = ReceiveState::RX_STATE_HEADER_1;
+                return false;  // Return immediately for performance reasons
+            }
+        }
+        else
+        {
+            return false;  // Return immediately for performance reasons
+        }
+    }
+
+    // Finally read all data bytes
+    if (current_stage == ReceiveState::RX_STATE_PACKET)
+    {
+        // This blocks until the buffer is filled or the stream has been emptied.
+        // Note that one more byte than "size" is read in. The last byte is the CRC.
+        while (_stream->available() && rx_array_inx <= size)
+        {
+            rx_buffer[rx_array_inx] = _stream->read();
+            rx_array_inx++;
+        }
+
+        // Need to check if the loop exits due to running out of data and exit now
+        if (rx_array_inx - 1 != size)
+        {
+            return false;  // Return immediately for performance reasons
+        }
+
+        // Seem to have got whole message. Calculate the CRC on the whole data packet minus the CRC byte.
+        uint8_t crc = CRC8.smbus(rx_buffer, size);
+
+        // Check if calculated CRC matches received value
+        boolean result = false;
+        if (crc == rx_buffer[size])
+        {
+            // CRC good
+            memcpy(address, rx_buffer, size);
+            result = true;
+        }
+
+        // We're done with the packet regardless of its validity so reset instance variables
+        rx_array_inx = 0;
+        looking_for_new_packet = true;
+        current_stage = ReceiveState::RX_STATE_HEADER_1;
+
+        if (EASY_TRANSFER_PRINT_DEBUG)
+        {
+            for (int i = 0; i < size; i++)
+            {
+                Serial.printf("%02x ", rx_buffer[i]);
+            }
+            Serial.printf("| CRC-Rx %02x | CRC-cal %02x | Valid %d", rx_buffer[size], crc, result);
+            Serial.println();
+        }
+
+        return result;
+    }
+
+    return false;
 }
